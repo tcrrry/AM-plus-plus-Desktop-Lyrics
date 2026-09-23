@@ -45,13 +45,39 @@ their own playback check.
 
 ## Sharing and updating
 
-The embedded Apple Music build is a split package. Run
-`scripts/package-tcrrry-embedded.ps1` on the patched output directory to make
-a single `.apks` file containing `base.apk` plus the matching ABI and density
-splits. Recipients install it with a split-package installer such as SAI or
-NPatch. A normal Android APK installer cannot install the `.apks` archive.
-The current `arm64-xxxhdpi` archive is a device-specific build; a general
-release needs the correct Apple Music splits for each supported device.
+Public releases of this branch contain the modified AM++ source and its
+standalone module APK. They do not contain Apple Music APKs or an embedded
+Apple Music `.apks` archive. The standalone module alone is useful with a
+compatible Xposed environment; it does not replace Apple Music or provide a
+rootless installation.
+
+For a rootless installation, obtain the matching Apple Music split APKs for
+your own device, then use NPatch locally to embed this branch's module APK.
+After patching, run `scripts/package-tcrrry-embedded.ps1` on the patched
+output directory to create a `.apks` archive containing `base.apk` and the
+matching ABI and density splits. Install the local archive with a split-package
+installer such as SAI or NPatch. The current integration was tested with
+Apple Music 6.5.3 (1599), arm64 and xxxhdpi; other variants need their own
+splits and compatibility testing. An ordinary APK installer cannot install
+the split archive. Keep the Apple Music binaries and resulting archive local;
+Apple Music's license restricts redistribution of its software.
+
+For the tested arm64/xxxhdpi variant, a local Windows example is:
+
+```powershell
+$NPatchCli = 'C:\path\to\npatch-cli.jar'
+$AppleBase = 'C:\path\to\origin.apk'
+$AppleArm64 = 'C:\path\to\split_config.arm64_v8a.apk'
+$AppleDensity = 'C:\path\to\split_config.xxxhdpi.apk'
+.\gradlew.bat :app:assembleDebug
+java -jar $NPatchCli --embed .\app\build\outputs\apk\debug\app-debug.apk --npatch-keystore --output .\patched $AppleBase $AppleArm64 $AppleDensity
+.\scripts\package-tcrrry-embedded.ps1 -InputDirectory .\patched -OutputFile .\Tcrrry-AMPP-local.apks
+```
+
+Use split APKs from one Apple Music installation and keep the same NPatch
+signing key when making updates for an existing installation. NPatch may name
+its patched base `origin-*-npatched.apk`; the packaging script expects this
+name and the arm64/xxxhdpi split names. Check the files before packaging.
 
 Keep the Tcrrry changes on the `tcrrry-lyrics` branch. For an upstream AM++
 release, fetch its new commit, merge it into this branch, resolve conflicts,

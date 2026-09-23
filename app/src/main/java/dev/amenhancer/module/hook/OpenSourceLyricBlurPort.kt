@@ -7,6 +7,7 @@ package dev.amenhancer.module.hook
 
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.Choreographer
 import android.view.MotionEvent
@@ -29,6 +30,9 @@ internal class OpenSourceLyricBlurPort(
     companion object {
         private const val TAG = "AMLyricBlur"
         private const val SCROLL_RESTORE_DELAY_MS = 1_000L
+        private const val FOLLOW_RECOVERY_DELAY_MS = 2_000L
+        private const val FOLLOW_RECOVERY_COOLDOWN_MS = 6_000L
+        private const val USER_BROWSING_GRACE_MS = 10_000L
         private const val MAX_RECYCLER_DISCOVERY_ATTEMPTS = 10
     }
 
@@ -45,6 +49,9 @@ internal class OpenSourceLyricBlurPort(
     private var scrollChangedListener: ViewTreeObserver.OnScrollChangedListener? = null
     private var isUserScrolling = false
     private var lastNativePosition: Long? = null
+    private var lastUserTouchAt = Long.MIN_VALUE
+    private var offscreenSince = 0L
+    private var lastFollowRecoveryAt = 0L
     private val scrollHandler by lazy { Handler(Looper.getMainLooper()) }
     private var blurFrameScheduled = false
     private val blurFrameCallback = Choreographer.FrameCallback {
@@ -60,6 +67,7 @@ internal class OpenSourceLyricBlurPort(
         if (highlightSession.enter(songInfo)) {
             wordHighlightState.clear()
             lastNativePosition = null
+            offscreenSince = 0L
             Log.i(TAG, "Lyric session changed")
             scheduleBlurUpdate()
         }
@@ -130,6 +138,7 @@ internal class OpenSourceLyricBlurPort(
         blurRenderer.clearAll()
         wordHighlightState.clear()
         lastNativePosition = null
+        offscreenSince = 0L
         recyclerView = null
         lyricsRootView = null
         lyricsFragmentOwner = null
@@ -199,9 +208,14 @@ internal class OpenSourceLyricBlurPort(
                 when (event.actionMasked) {
                     MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
                         isUserScrolling = true
+                        lastUserTouchAt = SystemClock.uptimeMillis()
+                        offscreenSince = 0L
                         scrollHandler.removeCallbacks(restoreBlurRunnable)
                     }
-                    MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_UP -> scheduleScrollRestore()
+                    MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_UP -> {
+                        lastUserTouchAt = SystemClock.uptimeMillis()
+                        scheduleScrollRestore()
+                    }
                 }
                 false
             }
@@ -300,6 +314,8 @@ internal class OpenSourceLyricBlurPort(
             visiblePositions = visibleRows.map { (_, position) -> position },
             gapAnchorPosition = gapAnchorPosition,
         )
+        val followIds = liveWordActiveIds.ifEmpty { highlightSession.snapshot() }
+        recoverLostFollow(rv, followIds, visibleRows.map { it.second })
         // One bounded diagnostic observation per coalesced frame; individual
         // renderer setters remain intentionally silent.
         probe.recordBlurFrame(
@@ -371,6 +387,34 @@ internal class OpenSourceLyricBlurPort(
         if (view !is ViewGroup) return false
         if (hasImageDescendant(view)) return false
         return true
+    }
+
+    private fun recoverLostFollow(rv: ViewGroup, activeIds: Set<Int>, visiblePositions: List<Int>) {
+        val target = LyricFollowRecoveryPolicy.offscreenTarget(
+            activeIds, visiblePositions, highlightSession.isGap(),
+        )
+        if (target == null || isUserScrolling) {
+            offscreenSince = 0L
+            return
+        }
+        val now = SystemClock.uptimeMillis()
+        if (offscreenSince == 0L) offscreenSince = now
+        if (now - offscreenSince < FOLLOW_RECOVERY_DELAY_MS ||
+            (lastUserTouchAt != Long.MIN_VALUE && now - lastUserTouchAt < USER_BROWSING_GRACE_MS) ||
+            now - lastFollowRecoveryAt < FOLLOW_RECOVERY_COOLDOWN_MS
+        ) return
+        lastFollowRecoveryAt = now
+        offscreenSince = 0L
+        rv.post {
+            if (recyclerView !== rv || isUserScrolling ||
+                (lastUserTouchAt != Long.MIN_VALUE &&
+                    SystemClock.uptimeMillis() - lastUserTouchAt < USER_BROWSING_GRACE_MS)) return@post
+            runCatching {
+                rv.javaClass.getMethod("smoothScrollToPosition", Int::class.javaPrimitiveType)
+                    .invoke(rv, target)
+                Log.i(TAG, "Recovered lyric follow at row $target")
+            }.onFailure { error -> Log.w(TAG, "Lyric follow recovery unavailable", error) }
+        }
     }
 
     private fun hasImageDescendant(view: View): Boolean {

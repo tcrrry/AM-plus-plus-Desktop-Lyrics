@@ -1,6 +1,7 @@
 package com.tcrrry.desktoplyrics
 
 import android.icu.text.Transliterator
+import android.os.Build
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
@@ -24,7 +25,9 @@ import java.util.concurrent.TimeUnit
  */
 class DirectLyricsRepository {
     private val latinTransliterator by lazy {
-        Transliterator.getInstance("Any-Latin; NFD; [:Nonspacing Mark:] Remove; NFC")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            Transliterator.getInstance("Any-Latin; NFD; [:Nonspacing Mark:] Remove; NFC")
+        } else null
     }
     data class Result(
         val lyrics: String = "",
@@ -984,13 +987,18 @@ class DirectLyricsRepository {
     }
 
     private fun latinSimilarity(first: String, second: String): Double {
-        val left = normalize(latinTransliterator.transliterate(first))
-        val right = normalize(latinTransliterator.transliterate(second))
+        val left = normalize(latinizeIfAvailable(first))
+        val right = normalize(latinizeIfAvailable(second))
         if (left.isBlank() || right.isBlank()) return 0.0
         if (left == right) return 1.0
         val distance = editDistance(left, right)
         return 1.0 - distance.toDouble() / maxOf(left.length, right.length).toDouble()
     }
+
+    private fun latinizeIfAvailable(value: String): String =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            latinTransliterator?.transliterate(value) ?: value
+        } else value
 
     private fun editDistance(first: String, second: String): Int {
         var previous = IntArray(second.length + 1) { it }

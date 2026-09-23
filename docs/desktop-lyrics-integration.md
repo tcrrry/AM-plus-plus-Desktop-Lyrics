@@ -79,8 +79,8 @@ signing key when making updates for an existing installation. NPatch may name
 its patched base `origin-*-npatched.apk`; the packaging script expects this
 name and the arm64/xxxhdpi split names. Check the files before packaging.
 
-Keep the Tcrrry changes on the `tcrrry-lyrics` branch. For an upstream AM++
-release, fetch its new commit, merge it into this branch, resolve conflicts,
+Keep the Tcrrry changes on this repository's `main` branch. For an upstream AM++
+release, fetch its new commit, merge it into `main`, resolve conflicts,
 run the project tests, and test settings and lyric injection on a phone. The
 module must then be embedded into Apple Music again. For a new Apple Music
 version, first follow `docs/apple-music-target-adaptation.md` to add and test

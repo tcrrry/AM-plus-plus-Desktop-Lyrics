@@ -1,6 +1,6 @@
 <a id="top"></a>
 
-> **Tcrrry 歌词源扩展版**：本分支基于 [Zennmn/AM-plus-plus](https://github.com/Zennmn/AM-plus-plus)，保留原项目的播放界面、歌词动画与其他功能，加入 [Tcrrry/desktop-lyrics](https://github.com/tcrrry/desktop-lyrics) 的歌词匹配与翻译功能。原项目及其贡献者保留各自的署名与权利；本分支的改动见 [集成说明](docs/desktop-lyrics-integration.md)。源码沿用仓库中的 GPL-3.0 许可证。
+> **Tcrrry 歌词源扩展版**：本项目基于 [Zennmn/AM-plus-plus](https://github.com/Zennmn/AM-plus-plus)，保留原项目的播放界面、歌词动画与其他功能，加入 [Tcrrry/desktop-lyrics](https://github.com/tcrrry/desktop-lyrics) 的歌词匹配与翻译功能。原项目及其贡献者保留各自的署名与权利；本项目的改动见 [集成说明](docs/desktop-lyrics-integration.md)。源码沿用仓库中的 GPL-3.0 许可证。
 
 > 此仓库的 Release 只提供 AM++ 修改源码及独立模块 APK，不包含 Apple Music 安装文件。没有 Root 的用户需要在自己的设备上取得 Apple Music 安装包，并在本地完成嵌入与安装。独立模块 APK 不能直接替换 Apple Music。
 

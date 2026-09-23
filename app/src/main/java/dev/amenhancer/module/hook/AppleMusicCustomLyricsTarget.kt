@@ -1,17 +1,22 @@
 package dev.amenhancer.module.hook
 
+import android.app.Application
 import android.os.Handler
 import android.os.Looper
 import dev.amenhancer.module.config.TargetConfigClient
 import dev.amenhancer.module.lyrics.CustomLyricsFilePolicy
 import dev.amenhancer.module.lyrics.CustomLyricsFileReader
 import dev.amenhancer.module.model.CustomLyricsEntry
+import dev.amenhancer.module.model.CustomLyricsSources
+import io.github.proify.lyricon.amprovider.xposed.MediaMetadataCache
+import java.lang.ref.WeakReference
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 /** Apple Music 6.5.0 adapter for user-managed, offline ID -> TTML mappings. */
 internal class AppleMusicCustomLyricsTarget(
+    private val application: Application,
     private val config: TargetConfigClient,
     private val symbols: TargetSymbolResolver,
     private val currentSong: CurrentSongIdentityCache,
@@ -70,17 +75,18 @@ internal class AppleMusicCustomLyricsTarget(
             }
         }
         val mainHandler = Handler(Looper.getMainLooper())
+        var activeFragment: WeakReference<Any>? = null
         lateinit var readyReapply: CustomLyricsReadyReapply
         val configuredManualIds = runCatching {
             config.customLyricsManifest().entries
-                .filter(CustomLyricsEntry::enabled)
+                .filter { it.enabled && it.source != CustomLyricsSources.AUTO_CACHE }
                 .mapTo(mutableSetOf(), CustomLyricsEntry::appleMusicId)
         }.getOrDefault(emptySet())
         val session = CustomLyricsReplacementSession(
             index = CustomLyricsIndexProvider {
-                config.customLyricsManifest().entries.associateBy(
-                    CustomLyricsEntry::appleMusicId,
-                )
+                config.customLyricsManifest().entries
+                    .filter { it.source != CustomLyricsSources.AUTO_CACHE }
+                    .associateBy(CustomLyricsEntry::appleMusicId)
             },
             readTtml = fileReader::read,
             parseTtml = parser::parse,
@@ -105,7 +111,36 @@ internal class AppleMusicCustomLyricsTarget(
         val autoSession = autoLyricsRuntime?.let { runtime ->
             AutoLyricsReplacementSession(
                 fetchCandidate = { appleMusicId ->
-                    runtime.resolver.fetch(appleMusicId)?.let { candidate ->
+                    val current = currentSong.current()
+                        ?.takeIf { it.details.appleMusicId == appleMusicId }
+                    val metadata = MediaMetadataCache.getMetadataById(appleMusicId.toString())
+                    val track = current?.details?.let { details ->
+                        val item = current.item
+                        DesktopLyricsTrack(
+                            appleMusicId = appleMusicId,
+                            explicitSource = CurrentLyricsSourceStatus.selectedSource(application, appleMusicId) != null,
+                            title = details.title?.takeIf(String::isNotBlank)
+                                ?: metadata?.title.orEmpty(),
+                            artist = details.artist?.takeIf(String::isNotBlank)
+                                ?: metadata?.artist.orEmpty(),
+                            album = itemAlbum(item)
+                                ?: metadata?.originalAlbum.orEmpty(),
+                            durationMs = itemNumber(item, "getDuration")
+                                ?: metadata?.duration?.coerceAtLeast(0L) ?: 0L,
+                        )
+                    }
+                    ModernXposedRuntime.log(
+                        "Desktop Lyrics lookup id=$appleMusicId " +
+                            "title=${track?.title.orEmpty().take(48)} " +
+                            "artist=${track?.artist.orEmpty().take(48)} " +
+                            "album=${track?.album.orEmpty().take(48)} " +
+                            "durationMs=${track?.durationMs ?: 0L}",
+                    )
+                    val resolved = runtime.resolver.fetch(appleMusicId, track)
+                    ModernXposedRuntime.log(
+                        "Desktop Lyrics lookup result id=$appleMusicId source=${resolved?.source ?: "none"}",
+                    )
+                    resolved?.let { candidate ->
                         val details = currentSong.current()
                             ?.takeIf { it.details.appleMusicId == appleMusicId }
                             ?.details
@@ -117,6 +152,22 @@ internal class AppleMusicCustomLyricsTarget(
                     }
                 },
                 cache = runtime.cache,
+                onRefreshFinished = { id, success ->
+                    mainHandler.post {
+                        if (currentSong.current()?.details?.appleMusicId == id) {
+                            android.widget.Toast.makeText(application,
+                                if (success) "歌词已更新" else "未找到新的可靠歌词，已保留当前歌词",
+                                android.widget.Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                },
+                onCandidatePrepared = { id, candidate ->
+                    if (candidate.source != CustomLyricsSources.AUTO_CACHE) {
+                        CurrentLyricsSourceStatus.rememberCandidate(
+                            application, id, candidate.source, "<translations>" in candidate.ttml,
+                        )
+                    }
+                },
                 parseTtml = parser::parse,
                 isAlive = parser::isAlive,
                 verifyPtr = parser::isValid,
@@ -125,7 +176,9 @@ internal class AppleMusicCustomLyricsTarget(
                 onReplacementPublished = { appleMusicId ->
                     mainHandler.post { readyReapply.onReplacementPublished(appleMusicId) }
                 },
-                publisher = runtime.publisher,
+                // Keep automatic results outside manual mappings so a later
+                // Desktop Lyrics lookup can supersede an older fallback.
+                publisher = null,
                 isAllowed = { appleMusicId ->
                     appleMusicId !in runtime.suppressedIds &&
                         appleMusicId !in configuredManualIds &&
@@ -165,7 +218,6 @@ internal class AppleMusicCustomLyricsTarget(
                         if (
                             appleMusicId != null &&
                             currentSong.current()?.details?.appleMusicId == appleMusicId &&
-                            shouldTryAutoLyricsForMetadata(metadata) &&
                             session.readyReplacementFor(appleMusicId) == null
                         ) {
                             autoSession?.ensureRequested(appleMusicId)
@@ -192,31 +244,25 @@ internal class AppleMusicCustomLyricsTarget(
                             fragmentAdamId = fragmentAdamId,
                             publishedAdamId = publishedAdamId,
                         )
+                        ModernXposedRuntime.log(
+                            "Desktop Lyrics I2 original=${original != null} fragmentId=${fragmentAdamId ?: 0L} " +
+                                "currentId=${publishedAdamId ?: 0L} selectedId=${adamId ?: 0L}",
+                        )
                         adamId ?: return@runCatching
+                        param.thisObject?.let { activeFragment = WeakReference(it) }
                         val manualReplacement = session.replacementFor(adamId)
                         val timingMetadata = timingObservations.metadataOf(original)
-                        val autoEligible = autoSession != null &&
-                            shouldTryAutoLyrics(
-                                original = original,
-                                metadata = timingMetadata,
-                            )
-                        val autoReplacement = when {
-                            shouldPrepareAutomaticLyrics(manualReplacement, autoEligible) -> {
-                                autoSession?.replacementFor(adamId)
-                            }
-                            manualReplacement == null -> {
-                                autoSession?.takeoverReplacementFor(
-                                    appleMusicId = adamId,
-                                    original = original,
-                                    metadata = timingMetadata,
-                                )
-                            }
-                            else -> null
-                        }
-                        // User-managed mappings always win; automatic sources are
-                        // only a fallback for a missing/non-Word pointer or an
-                        // explicitly foreign Word document without translation.
+                        val autoEligible = autoSession != null
+                        val autoReplacement = if (manualReplacement == null) {
+                            autoSession?.replacementFor(adamId)
+                        } else null
+                        // User-managed mappings win. Desktop Lyrics is first
+                        // among automatic sources, even when Apple has Word TTML.
                         val replacement = manualReplacement ?: autoReplacement
+                        ModernXposedRuntime.log(
+                            "Desktop Lyrics I2 choice id=$adamId manual=${manualReplacement != null} " +
+                                "auto=${autoReplacement != null} tracking=${autoSession?.isTracking(adamId) == true}",
+                        )
                         val tracking = session.isTracking(adamId) ||
                             (autoEligible && autoSession?.isTracking(adamId) == true)
                         val needsRebind = original == null &&
@@ -242,8 +288,12 @@ internal class AppleMusicCustomLyricsTarget(
                                 autoSession?.markTakeoverApplied(adamId)
                             }
                             param.thisObject?.let { readyReapply.dismiss(it) }
+                            CurrentLyricsSourceStatus.recordApplied(
+                                application, adamId, manualReplacement != null,
+                            )
                             if (replacement !== original) {
                                 param.args[0] = replacement
+                                ModernXposedRuntime.log("Desktop Lyrics I2 installed id=$adamId")
                             }
                         }
                     }.onFailure { error ->
@@ -330,11 +380,14 @@ internal class AppleMusicCustomLyricsTarget(
                         val replacementReady = appleMusicId != null &&
                             (session.replacementOrPrepareFor(appleMusicId) != null ||
                                 autoSession?.replacementOrPrepareFor(appleMusicId) != null)
+                        val replacementPending = appleMusicId != null &&
+                            (session.isTracking(appleMusicId) || autoSession?.isTracking(appleMusicId) == true)
                         if (
                             shouldExposeCustomLyrics(
                                 nativeLyricsAvailable = nativeLyricsAvailable,
                                 appleMusicId = appleMusicId,
                                 replacementReady = replacementReady,
+                                replacementPending = replacementPending,
                             )
                         ) {
                             param.result = true
@@ -346,15 +399,32 @@ internal class AppleMusicCustomLyricsTarget(
             })
         }.isSuccess
         session.start()
+        CurrentLyricsSourceStatus.installRefreshHandler { id ->
+            if (currentSong.current()?.details?.appleMusicId == id && autoSession != null && !session.isMapped(id)) {
+                mainHandler.post {
+                    activeFragment?.get()?.let { readyReapply.recordMiss(it, id) }
+                    autoSession.refreshCurrent(id)
+                }
+                true
+            } else false
+        }
         currentSong.addListener { current ->
             val appleMusicId = current?.details?.appleMusicId
+            ModernXposedRuntime.log(
+                "Desktop Lyrics song id=${appleMusicId ?: 0L} " +
+                    "auto=${autoSession != null} " +
+                    "suppressed=${appleMusicId in (autoLyricsRuntime?.suppressedIds ?: emptySet())} " +
+                    "manual=${appleMusicId in configuredManualIds} " +
+                    "mapped=${appleMusicId?.let(session::isMapped) ?: false}",
+            )
             appleMusicId?.let(session::ensureRequested)
             autoSession?.onSongChanged(appleMusicId)
             appleMusicId?.let { id ->
-                timingObservations.metadataOfAppleMusicId(id)
-                    ?.takeIf(::shouldTryAutoLyricsForMetadata)
-                    ?.takeIf { session.readyReplacementFor(id) == null }
-                    ?.let { autoSession?.ensureRequested(id) }
+                ModernXposedRuntime.log(
+                    "Desktop Lyrics eligibility id=$id manualReady=${session.readyReplacementFor(id) != null} " +
+                        "manualMapped=${session.isMapped(id)}",
+                )
+                if (session.readyReplacementFor(id) == null) autoSession?.ensureRequested(id)
             }
         }
         if (!availabilityHooked) {
@@ -365,7 +435,7 @@ internal class AppleMusicCustomLyricsTarget(
         }
         return TargetCapabilityInstall.Active(
             "Custom lyric ID mappings installed" +
-                (if (autoSession != null) " with automatic Word-TTML fallback" else "") + "; " +
+                (if (autoSession != null) " with Desktop Lyrics preferred auto TTML" else "") + "; " +
                 listOf(
                     installMethodResolution.summary,
                     availabilityResolution.summary,
@@ -381,6 +451,24 @@ internal class AppleMusicCustomLyricsTarget(
     }
 
 }
+
+private fun itemString(item: Any, method: String): String? = runCatching {
+    item.javaClass.getMethod(method).invoke(item) as? String
+}.getOrNull()?.trim()?.takeIf(String::isNotEmpty)
+
+private fun itemAlbum(item: Any): String? =
+    itemString(item, "getAlbumName") ?: itemString(item, "getAlbumTitle") ?: runCatching {
+        item.javaClass.getMethod("getAlbum").invoke(item)
+    }.getOrNull()?.let { album ->
+        (album as? String)?.trim()?.takeIf(String::isNotEmpty)
+            ?: itemString(album, "getName") ?: itemString(album, "getTitle")
+    } ?: runCatching {
+        item.javaClass.getMethod("getAttributes").invoke(item)
+    }.getOrNull()?.let { attributes -> itemString(attributes, "getAlbumName") }
+
+private fun itemNumber(item: Any, method: String): Long? = runCatching {
+    (item.javaClass.getMethod(method).invoke(item) as? Number)?.toLong()
+}.getOrNull()?.takeIf { it > 0L }
 
 internal fun selectLyricsInjectionAdamId(
     original: Any?,
@@ -430,4 +518,6 @@ internal fun shouldExposeCustomLyrics(
     nativeLyricsAvailable: Boolean,
     appleMusicId: Long?,
     replacementReady: Boolean,
-): Boolean = nativeLyricsAvailable || (appleMusicId != null && appleMusicId > 0L && replacementReady)
+    replacementPending: Boolean = false,
+): Boolean = nativeLyricsAvailable ||
+    (appleMusicId != null && appleMusicId > 0L && (replacementReady || replacementPending))

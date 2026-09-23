@@ -11,8 +11,23 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class AutoLyricsReplacementSessionTest {
+    @Test fun failedRefreshRetainsPreviousPointer() {
+        val queued = QueuedExecutor()
+        val pointer = Pointer()
+        var available = true
+        val session = session(queued, fetch = {
+            if (available) AutoLyricsCandidate("desktop-lyrics:test", WORD_TTML) else null
+        }, parse = { pointer })
+        session.onSongChanged(42L)
+        session.ensureRequested(42L)
+        queued.runAll()
+        available = false
+        session.refreshCurrent(42L)
+        queued.runAll()
+        assertSame(pointer, session.readyReplacementFor(42L))
+    }
     @Test
-    fun `cold lookup keeps original path until a validated candidate publishes`() {
+    fun `cold lookup keeps original path until a validated candidate publishes without caching fallback`() {
         val queued = QueuedExecutor()
         val cache = MemoryCache()
         val pointer = Pointer()
@@ -38,7 +53,7 @@ class AutoLyricsReplacementSessionTest {
         assertEquals(1, fetches)
         assertEquals(1, published)
         assertEquals(42L, pointer.adamId)
-        assertEquals(WORD_TTML, cache.values[42L])
+        assertNull(cache.values[42L])
     }
 
     @Test
@@ -59,6 +74,23 @@ class AutoLyricsReplacementSessionTest {
 
         assertSame(pointer, session.readyReplacementFor(42L))
         assertEquals(0, fetches)
+    }
+
+    @Test
+    fun `Desktop Lyrics result is cached for the next playback`() {
+        val queued = QueuedExecutor()
+        val cache = MemoryCache()
+        val session = session(
+            queued = queued,
+            cache = cache,
+            fetch = { AutoLyricsCandidate("desktop-lyrics:QQ音乐", WORD_TTML) },
+            parse = { Pointer() },
+        )
+
+        assertNull(session.replacementFor(42L))
+        queued.runAll()
+
+        assertEquals(WORD_TTML, cache.values[42L])
     }
 
     @Test
@@ -241,6 +273,23 @@ class AutoLyricsReplacementSessionTest {
             assertTrue(cache.write(42L, WORD_TTML))
             assertEquals(WORD_TTML, FileAutoLyricsCache(directory).read(42L))
             assertTrue(!cache.write(43L, LINE_TTML))
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `file cache evicts least recently used lyric when byte budget is full`() {
+        val directory = Files.createTempDirectory("ampp-auto-lyrics-lru-test").toFile()
+        try {
+            val cache = FileAutoLyricsCache(directory, maxBytes = WORD_TTML.toByteArray().size.toLong() * 2)
+            assertTrue(cache.write(1L, WORD_TTML))
+            assertTrue(cache.write(2L, WORD_TTML))
+            assertEquals(WORD_TTML, cache.read(1L))
+            assertTrue(cache.write(3L, WORD_TTML))
+            assertEquals(null, cache.read(2L))
+            assertEquals(WORD_TTML, cache.read(1L))
+            assertEquals(WORD_TTML, cache.read(3L))
         } finally {
             directory.deleteRecursively()
         }

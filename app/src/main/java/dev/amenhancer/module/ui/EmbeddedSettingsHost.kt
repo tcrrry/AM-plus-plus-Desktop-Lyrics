@@ -52,6 +52,8 @@ import dev.amenhancer.module.config.TitleCorrectionMode
 import dev.amenhancer.module.CurrentSongDetails
 import dev.amenhancer.module.hook.AmLyricsClient
 import dev.amenhancer.module.hook.AmllTtmlClient
+import dev.amenhancer.module.hook.CurrentLyricsSourceStatus
+import dev.amenhancer.module.hook.TcrrryLyricsHistory
 import dev.amenhancer.module.hook.FileLunabeatCatalogCache
 import dev.amenhancer.module.hook.HttpLyricTransport
 import dev.amenhancer.module.hook.ModernXposedRuntime
@@ -85,6 +87,7 @@ internal enum class EmbeddedHostActivityRole {
 internal enum class EmbeddedSettingsPage {
     MAIN,
     CUSTOM_LYRICS,
+    TCRRRY_LYRICS,
 }
 
 private data class EmbeddedLyricsEditorAction(
@@ -2047,17 +2050,30 @@ internal class EmbeddedSettingsHost private constructor(
         }
 
         fun renderPage() {
+            val tcrrryPage = page == EmbeddedSettingsPage.TCRRRY_LYRICS
+            val pageColor = if (tcrrryPage) 0xFF090909.toInt() else EmbeddedSettingsPalette.pageBackground
+            panelBackground.setColor(pageColor)
+            pageHost.setBackgroundColor(pageColor)
+            topBar.setBackgroundColor(pageColor)
+            pageContent.setBackgroundColor(pageColor)
+            pageTitle.setTextColor(if (tcrrryPage) Color.WHITE else EmbeddedSettingsPalette.onSurface)
+            saveButton.visibility = if (tcrrryPage) View.GONE else View.VISIBLE
+            headerDivider.setBackgroundColor(if (tcrrryPage) 0xFF27272B.toInt() else EmbeddedSettingsPalette.divider)
             root.minimumHeight = embeddedDialogContentHeight(activity, page)
             pageContent.removeAllViews()
             val scroll = ScrollView(activity).apply {
                 isFillViewport = true
                 isVerticalScrollBarEnabled = false
-        val horizontalInset = if (page == EmbeddedSettingsPage.CUSTOM_LYRICS) 4 else 8
+                val horizontalInset = when (page) {
+                    EmbeddedSettingsPage.TCRRRY_LYRICS -> 0
+                    EmbeddedSettingsPage.CUSTOM_LYRICS -> 4
+                    else -> 8
+                }
                 setPadding(
                     dp(activity, horizontalInset),
                     0,
                     dp(activity, horizontalInset),
-                    dp(activity, if (page == EmbeddedSettingsPage.CUSTOM_LYRICS) 8 else 12),
+                    dp(activity, if (page == EmbeddedSettingsPage.CUSTOM_LYRICS) 8 else if (tcrrryPage) 0 else 12),
                 )
             }
             val content = LinearLayout(activity).apply {
@@ -2070,15 +2086,22 @@ internal class EmbeddedSettingsHost private constructor(
             ))
 
             val customLyricsPage = page == EmbeddedSettingsPage.CUSTOM_LYRICS
-            pageTitle.text = if (customLyricsPage) "自定义歌词" else "AM++"
+            val subPage = page != EmbeddedSettingsPage.MAIN
+            pageTitle.text = when (page) {
+                EmbeddedSettingsPage.CUSTOM_LYRICS -> "自定义歌词"
+                EmbeddedSettingsPage.TCRRRY_LYRICS -> "Tcrrry 歌词设置"
+                EmbeddedSettingsPage.MAIN -> "AM++"
+            }
             (pageTitle.layoutParams as? LinearLayout.LayoutParams)?.let { params ->
                 params.marginStart = dp(activity, if (customLyricsPage && !isEmbeddedPhone(activity)) 20 else 0)
                 pageTitle.layoutParams = params
             }
-            backButton.visibility = if (customLyricsPage) View.VISIBLE else View.GONE
-            moduleIcon.visibility = if (customLyricsPage) View.GONE else View.VISIBLE
-            headerDivider.visibility = if (customLyricsPage) View.VISIBLE else View.GONE
-            if (customLyricsPage) {
+            backButton.visibility = if (subPage) View.VISIBLE else View.GONE
+            moduleIcon.visibility = if (subPage) View.GONE else View.VISIBLE
+            headerDivider.visibility = if (subPage) View.VISIBLE else View.GONE
+            if (page == EmbeddedSettingsPage.TCRRRY_LYRICS) {
+                renderEmbeddedTcrrryLyricsPage(activity, content, controller.currentSongDetails())
+            } else if (customLyricsPage) {
                 renderEmbeddedCustomLyricsPage(
                     activity = activity,
                     parent = content,
@@ -2097,6 +2120,10 @@ internal class EmbeddedSettingsHost private constructor(
                         page = EmbeddedSettingsPage.CUSTOM_LYRICS
                         renderPage()
                     },
+                    onOpenTcrrryLyrics = {
+                        page = EmbeddedSettingsPage.TCRRRY_LYRICS
+                        renderPage()
+                    },
                     onChooseFont = {
                         launchSafPicker(
                             activity,
@@ -2113,7 +2140,7 @@ internal class EmbeddedSettingsHost private constructor(
         }
 
         backButton.setOnClickListener {
-            if (page == EmbeddedSettingsPage.CUSTOM_LYRICS) {
+            if (page != EmbeddedSettingsPage.MAIN) {
                 page = EmbeddedSettingsPage.MAIN
                 renderPage()
             } else {
@@ -2159,10 +2186,22 @@ internal class EmbeddedSettingsHost private constructor(
         lyricsCount: Int,
         onSettingsChanged: (ModuleSettings) -> Unit,
         onOpenCustomLyrics: () -> Unit,
+        onOpenTcrrryLyrics: () -> Unit,
         onChooseFont: () -> Unit,
         onClearFont: () -> Unit,
     ) {
         parent.addView(embeddedCard(activity, "功能", outlined = false) {
+            addView(embeddedNavigationRow(
+                activity,
+                "Tcrrry 歌词设置",
+                "查看来源、切换版本、重新匹配、调整时间偏移",
+                iconDrawable = EmbeddedGlyphDrawable(
+                    EmbeddedGlyphKind.Music,
+                    EmbeddedSettingsPalette.accent,
+                ),
+                onClick = onOpenTcrrryLyrics,
+            ))
+            addView(embeddedDivider(activity))
             addView(embeddedSettingRow(
                 activity,
                 "平板双栏播放器",
@@ -2281,6 +2320,17 @@ internal class EmbeddedSettingsHost private constructor(
             addView(embeddedDivider(activity))
             addView(embeddedNavigationRow(
                 activity,
+                "当前歌词来源",
+                CurrentLyricsSourceStatus.description(activity, controller.currentSongDetails()?.appleMusicId),
+                iconDrawable = EmbeddedGlyphDrawable(
+                    EmbeddedGlyphKind.Music,
+                    EmbeddedSettingsPalette.accent,
+                ),
+                onClick = onOpenCustomLyrics,
+            ))
+            addView(embeddedDivider(activity))
+            addView(embeddedNavigationRow(
+                activity,
                 "自定义歌词",
                 if (lyricsCount == 0) "添加和管理 Apple Music ID 歌词映射" else "已配置 $lyricsCount 首歌词",
                 iconDrawable = EmbeddedGlyphDrawable(
@@ -2323,6 +2373,13 @@ internal class EmbeddedSettingsHost private constructor(
         ))
     }
 
+    private fun renderEmbeddedTcrrryLyricsPage(
+        activity: Activity,
+        parent: LinearLayout,
+        song: CurrentSongDetails?,
+    ) {
+        TcrrryLyricsSettingsUi.render(activity, parent, song) { pageRefresh?.invoke() }
+    }
     private fun renderEmbeddedCustomLyricsPage(
         activity: Activity,
         parent: LinearLayout,
@@ -2330,6 +2387,11 @@ internal class EmbeddedSettingsHost private constructor(
         song: CurrentSongDetails?,
         onSettingsChanged: (ModuleSettings) -> Unit,
     ) {
+        parent.addView(embeddedInfoCard(
+            activity,
+            "当前歌词来源：${CurrentLyricsSourceStatus.description(activity, song?.appleMusicId)}",
+        ))
+        parent.addView(embeddedSpacer(activity, if (isEmbeddedPhone(activity)) 10 else 14))
         val entries = runCatching { controller.lyricsEntries() }.getOrDefault(emptyList())
         customLyricsListState.update(entries, customLyricsSearchQuery)
 

@@ -12,10 +12,12 @@ class CustomLyricsAvailabilityPolicyTest {
     }
 
     @Test
-    fun `unavailable lyrics stay closed until an exact replacement is ready`() {
+    fun `unavailable lyrics open while exact replacement is loading`() {
         assertFalse(shouldExposeCustomLyrics(false, null, replacementReady = true))
         assertFalse(shouldExposeCustomLyrics(false, 0L, replacementReady = true))
         assertFalse(shouldExposeCustomLyrics(false, 42L, replacementReady = false))
+        assertTrue(shouldExposeCustomLyrics(false, 42L, replacementReady = false, replacementPending = true))
+        assertFalse(shouldExposeCustomLyrics(false, null, replacementReady = false, replacementPending = true))
         assertTrue(shouldExposeCustomLyrics(false, 42L, replacementReady = true))
     }
 }

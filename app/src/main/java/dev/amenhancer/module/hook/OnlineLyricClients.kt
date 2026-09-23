@@ -33,9 +33,17 @@ internal data class AutoLyricsSource(
  */
 internal class AutoLyricsSourceResolver(
     private val sources: List<AutoLyricsSource>,
+    private val desktopLyrics: ((DesktopLyricsTrack) -> AutoLyricsCandidate?)? = null,
 ) {
-    fun fetch(appleMusicId: Long): AutoLyricsCandidate? {
+    fun fetch(appleMusicId: Long, track: DesktopLyricsTrack? = null): AutoLyricsCandidate? {
         if (appleMusicId <= 0L) return null
+        if (track != null) {
+            val preferred = runCatching { desktopLyrics?.invoke(track) }.getOrNull()
+            if (preferred != null && TtmlInputPolicy.isAcceptable(preferred.ttml) &&
+                TtmlTimingPolicy.isWord(preferred.ttml)
+            ) return preferred
+            if (track.explicitSource) return null
+        }
         sources.forEach { source ->
             val ttml = runCatching { source.fetch(appleMusicId) }.getOrNull() ?: return@forEach
             if (!TtmlInputPolicy.isAcceptable(ttml) || !TtmlTimingPolicy.isWord(ttml)) {
@@ -52,6 +60,7 @@ internal class AutoLyricsSourceResolver(
             amll: AmllTtmlClient,
             amLyrics: AmLyricsClient,
             lunabeat: LunabeatClient,
+            desktopLyrics: ((DesktopLyricsTrack) -> AutoLyricsCandidate?)? = null,
         ): AutoLyricsSourceResolver = AutoLyricsSourceResolver(
             listOf(
                 AutoLyricsSource(CustomLyricsSources.AMLL) { raw ->
@@ -60,6 +69,7 @@ internal class AutoLyricsSourceResolver(
                 AutoLyricsSource(CustomLyricsSources.LUNABEAT, lunabeat::fetch),
                 AutoLyricsSource(CustomLyricsSources.AM_LYRICS, amLyrics::fetch),
             ),
+            desktopLyrics,
         )
     }
 }

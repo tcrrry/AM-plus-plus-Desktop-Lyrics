@@ -116,14 +116,14 @@ class CustomLyricsItemUpdateStructuralRegressionTest {
     }
 
     @Test
-    fun `automatic fallback is prewarmed from observed native metadata and manual ready wins`() {
+    fun `preferred automatic lookup starts for every song and manual ready wins`() {
         val target = projectFile(
             "app/src/main/java/dev/amenhancer/module/hook/AppleMusicCustomLyricsTarget.kt",
         )
 
-        assertTrue(target.contains("metadataOfAppleMusicId(id)"))
-        assertTrue(target.contains("shouldTryAutoLyricsForMetadata(metadata)"))
+        assertTrue(target.contains("autoSession?.onSongChanged(appleMusicId)"))
+        assertTrue(target.contains("autoSession?.ensureRequested(id)"))
         assertTrue(target.contains("session.readyReplacementFor(appleMusicId) == null"))
-        assertTrue(target.contains("shouldPrepareAutomaticLyrics(manualReplacement, autoEligible)"))
+        assertTrue(target.contains("manualReplacement ?: autoReplacement"))
     }
 }

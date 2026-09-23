@@ -1,12 +1,7 @@
 package dev.amenhancer.module.hook
 
 import android.app.Application
-import dev.amenhancer.module.config.EmbeddedConfigurationSession
-import dev.amenhancer.module.config.EmbeddedContentManager
-import dev.amenhancer.module.config.HostPrivateEmbeddedStorage
 import dev.amenhancer.module.lyrics.CustomLyricsFilePolicy
-import dev.amenhancer.module.lyrics.CustomLyricsDraft
-import dev.amenhancer.module.lyrics.CustomLyricsSaveResult
 import dev.amenhancer.module.lyrics.TtmlInputPolicy
 import dev.amenhancer.module.model.CustomLyricsSources
 import java.io.File
@@ -23,7 +18,7 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import org.json.JSONArray
 
-private const val AUTO_CACHE_DIRECTORY = "ampp-auto-lyrics"
+private const val AUTO_CACHE_DIRECTORY = "ampp-auto-lyrics-desktop-v6"
 
 /** A validated candidate returned by one of the automatic lyric sources. */
 internal data class AutoLyricsCandidate(
@@ -90,40 +85,9 @@ internal fun createAutoLyricsRuntime(
         amll = AmllTtmlClient(lyricTransport),
         amLyrics = AmLyricsClient(lyricTransport),
         lunabeat = lunabeat,
+        desktopLyrics = DesktopLyricsSource(application)::fetch,
     )
     val cache = FileAutoLyricsCache(root)
-    val configuredContent = EmbeddedContentManager(
-        session = EmbeddedConfigurationSession(HostPrivateEmbeddedStorage(application)),
-    )
-    val publisher = AutoLyricsPublisher { appleMusicId, candidate ->
-        val existing = runCatching {
-            configuredContent.listLyrics().firstOrNull { it.appleMusicId == appleMusicId }
-        }.getOrNull()
-        when {
-            existing != null && existing.enabled -> AutoLyricsPublishResult.ALREADY_CONFIGURED
-            existing != null -> AutoLyricsPublishResult.FAILED
-            else -> {
-                val displayName = candidate.displayName
-                    ?.takeIf(String::isNotBlank)
-                    ?: "自动缓存歌词 · $appleMusicId"
-                when (
-                    runCatching {
-                        configuredContent.saveLyrics(
-                            CustomLyricsDraft(
-                                appleMusicId = appleMusicId,
-                                displayName = displayName,
-                                ttml = candidate.ttml,
-                                source = candidate.source,
-                            ),
-                        )
-                    }.getOrNull()
-                ) {
-                    is CustomLyricsSaveResult.Saved -> AutoLyricsPublishResult.PUBLISHED
-                    else -> AutoLyricsPublishResult.FAILED
-                }
-            }
-        }
-    }
     val executor = ThreadPoolExecutor(
         1,
         1,
@@ -134,34 +98,11 @@ internal fun createAutoLyricsRuntime(
         { runnable -> Thread(runnable, "ampp-auto-lyrics").apply { isDaemon = true } },
         ThreadPoolExecutor.DiscardOldestPolicy(),
     )
-    runCatching {
-        executor.execute {
-            cache.cachedIds().forEach { appleMusicId ->
-                if (appleMusicId in suppressedIds) return@forEach
-                val ttml = cache.read(appleMusicId)
-                    ?.takeIf(TtmlTimingPolicy::isWord)
-                    ?: return@forEach
-                when (
-                    runCatching {
-                        publisher.publish(
-                            appleMusicId,
-                            AutoLyricsCandidate(CustomLyricsSources.AUTO_CACHE, ttml),
-                        )
-                    }.getOrDefault(AutoLyricsPublishResult.FAILED)
-                ) {
-                    AutoLyricsPublishResult.PUBLISHED,
-                    AutoLyricsPublishResult.ALREADY_CONFIGURED,
-                    -> cache.delete(appleMusicId)
-                    AutoLyricsPublishResult.FAILED -> Unit
-                }
-            }
-        }
-    }
     return AutoLyricsRuntime(
         resolver = resolver,
         cache = cache,
         executor = executor,
-        publisher = publisher,
+        publisher = null,
         suppressedIds = suppressedIds,
     )
 }
@@ -175,29 +116,40 @@ internal fun createAutoLyricsRuntime(
 internal class FileAutoLyricsCache(
     private val directory: File,
     private val maxEntries: Int = MAX_ENTRIES,
+    private val maxBytes: Long = MAX_CACHE_BYTES,
 ) : AutoLyricsCache {
     private val indexFile = File(directory, INDEX_FILE_NAME)
 
-    override fun read(appleMusicId: Long): String? {
+    @Synchronized override fun read(appleMusicId: Long): String? {
         if (appleMusicId <= 0L) return null
         val file = lyricFile(appleMusicId) ?: return null
         return runCatching {
             if (!file.isFile || file.length() !in 1L..MAX_TTML_BYTES) return@runCatching null
-            FileInputStream(file).use { input ->
+            val result = FileInputStream(file).use { input ->
                 CustomLyricsFilePolicy.readBounded(input).toString(Charsets.UTF_8)
             }
+            val ids = readIds().toMutableList()
+            if (ids.remove(appleMusicId)) {
+                ids.add(appleMusicId)
+                writeIndex(ids)
+            }
+            result
         }.getOrNull()
     }
 
-    override fun delete(appleMusicId: Long): Boolean {
+    @Synchronized override fun delete(appleMusicId: Long): Boolean {
         if (appleMusicId <= 0L) return false
         val file = lyricFile(appleMusicId) ?: return false
-        return runCatching { file.isFile && file.delete() }.getOrDefault(false)
+        return runCatching {
+            val deleted = file.isFile && file.delete()
+            if (deleted) writeIndex(readIds().filterNot { it == appleMusicId })
+            deleted
+        }.getOrDefault(false)
     }
 
     override fun cachedIds(): List<Long> = readIds()
 
-    override fun write(appleMusicId: Long, ttml: String): Boolean {
+    @Synchronized override fun write(appleMusicId: Long, ttml: String): Boolean {
         if (
             appleMusicId <= 0L ||
             !TtmlInputPolicy.isAcceptable(ttml) ||
@@ -205,7 +157,7 @@ internal class FileAutoLyricsCache(
         ) return false
         val bytes = ttml.toByteArray(Charsets.UTF_8)
         val file = lyricFile(appleMusicId) ?: return false
-        if (bytes.size > MAX_TTML_BYTES) return false
+        if (bytes.size > MAX_TTML_BYTES || bytes.size > maxBytes) return false
         return runCatching {
             if (!directory.exists() && !directory.mkdirs()) return@runCatching false
             atomicWrite(file, bytes)
@@ -213,10 +165,14 @@ internal class FileAutoLyricsCache(
                 remove(appleMusicId)
                 add(appleMusicId)
             }
-            val keep = ids.takeLast(maxEntries.coerceAtLeast(1))
-            ids.dropLast(keep.size).forEach { oldId -> lyricFile(oldId)?.delete() }
-            val index = JSONArray().apply { keep.forEach(::put) }
-            atomicWrite(indexFile, index.toString().toByteArray(Charsets.UTF_8))
+            var totalBytes = ids.sumOf { lyricFile(it)?.takeIf(File::isFile)?.length() ?: 0L }
+            while (ids.size > maxEntries.coerceAtLeast(1) || totalBytes > maxBytes.coerceAtLeast(1L)) {
+                val oldest = ids.removeAt(0)
+                val oldFile = lyricFile(oldest)
+                totalBytes -= oldFile?.takeIf(File::isFile)?.length() ?: 0L
+                oldFile?.delete()
+            }
+            writeIndex(ids)
             true
         }.getOrDefault(false)
     }
@@ -232,6 +188,11 @@ internal class FileAutoLyricsCache(
             }
         }.distinct()
     }.getOrDefault(emptyList())
+
+    private fun writeIndex(ids: List<Long>) {
+        val index = JSONArray().apply { ids.forEach(::put) }
+        atomicWrite(indexFile, index.toString().toByteArray(Charsets.UTF_8))
+    }
 
     private fun lyricFile(appleMusicId: Long): File? = appleMusicId
         .takeIf { it > 0L }
@@ -268,9 +229,10 @@ internal class FileAutoLyricsCache(
         const val FILE_PREFIX = "lyric_"
         const val FILE_SUFFIX = ".ttml"
         const val INDEX_FILE_NAME = "index.json"
-        const val MAX_ENTRIES = 64
+        const val MAX_ENTRIES = 50_000
+        const val MAX_CACHE_BYTES = 2L * 1024 * 1024 * 1024
         const val MAX_TTML_BYTES = 512 * 1024L
-        const val MAX_INDEX_BYTES = 16 * 1024L
+        const val MAX_INDEX_BYTES = 1024 * 1024L
     }
 }
 
@@ -287,6 +249,8 @@ internal class AutoLyricsReplacementSession(
     private val readAdamId: (Any) -> Long?,
     private val bindAdamId: (Any, Long) -> Boolean,
     private val onReplacementPublished: ((Long) -> Unit)? = null,
+    private val onCandidatePrepared: ((Long, AutoLyricsCandidate) -> Unit)? = null,
+    private val onRefreshFinished: ((Long, Boolean) -> Unit)? = null,
     private val publisher: AutoLyricsPublisher? = null,
     private val isAllowed: (Long) -> Boolean = { true },
     private val executor: Executor,
@@ -305,6 +269,8 @@ internal class AutoLyricsReplacementSession(
     private var activeSongKnown = false
     private var activeAppleMusicId: Long? = null
     private val activeTakeovers = mutableSetOf<Long>()
+    private var refreshBackup: Pair<Long, Any>? = null
+    private var refreshGeneration: Long? = null
 
     /** Invalidates in-flight results and native pointers only when playback changes. */
     fun onSongChanged(appleMusicId: Long?) {
@@ -318,6 +284,8 @@ internal class AutoLyricsReplacementSession(
                 pending.clear()
                 failedUntil.clear()
                 activeTakeovers.clear()
+                refreshBackup = null
+                refreshGeneration = null
             }
             !sameSong
         }
@@ -339,6 +307,19 @@ internal class AutoLyricsReplacementSession(
         if (appleMusicId > 0L && isCurrentSong(appleMusicId) && isAllowed(appleMusicId)) {
             request(appleMusicId)
         }
+    }
+
+    fun refreshCurrent(appleMusicId: Long) {
+        if (!isCurrentSong(appleMusicId)) return
+        val old = readyReplacementFor(appleMusicId) ?: refreshBackup?.takeIf { it.first == appleMusicId }?.second
+        runCatching { cache.delete(appleMusicId) }
+        onSongChanged(null)
+        onSongChanged(appleMusicId)
+        synchronized(lock) {
+            refreshBackup = old?.let { appleMusicId to it }
+            refreshGeneration = generation
+        }
+        ensureRequested(appleMusicId)
     }
 
     fun isTracking(appleMusicId: Long): Boolean = synchronized(lock) {
@@ -396,7 +377,10 @@ internal class AutoLyricsReplacementSession(
 
     private fun request(appleMusicId: Long) {
         synchronized(lock) {
-            if (!isCurrentSongLocked(appleMusicId)) return
+            if (!isCurrentSongLocked(appleMusicId)) {
+                logger("automatic lyrics skipped stale song id=$appleMusicId")
+                return
+            }
             val requestGeneration = generation
             if (pending[appleMusicId] == requestGeneration) return
             synchronized(pointers) {
@@ -405,6 +389,7 @@ internal class AutoLyricsReplacementSession(
             val retryAt = failedUntil[appleMusicId] ?: 0L
             if (retryAt > nowMs()) return
             pending[appleMusicId] = requestGeneration
+            logger("automatic lyrics queued id=$appleMusicId generation=$requestGeneration")
             try {
                 executor.execute { prepare(appleMusicId, requestGeneration) }
             } catch (_: RejectedExecutionException) {
@@ -419,21 +404,32 @@ internal class AutoLyricsReplacementSession(
         var preparedCandidate: AutoLyricsCandidate? = null
         var preparedPointer: Any? = null
         try {
-            if (!isCurrentRequest(appleMusicId, requestGeneration)) return
+            if (!isCurrentRequest(appleMusicId, requestGeneration)) {
+                logger("automatic lyrics cancelled before fetch id=$appleMusicId")
+                return
+            }
             val cached = runCatching { cache.read(appleMusicId) }.getOrNull()
+            logger("automatic lyrics cache id=$appleMusicId hit=${cached != null}")
             if (cached != null && isCurrentRequest(appleMusicId, requestGeneration)) {
                 val candidate = AutoLyricsCandidate(CustomLyricsSources.AUTO_CACHE, cached)
+                logger(
+                    "automatic lyrics cache parse begin id=$appleMusicId bytes=${cached.length} " +
+                        "translation=${"<translations>" in cached}",
+                )
                 preparedPointer = preparePointer(
                     candidate.ttml,
                     appleMusicId,
                     source = candidate.source,
                     requestGeneration = requestGeneration,
                 )
+                logger("automatic lyrics cache parse end id=$appleMusicId ready=${preparedPointer != null}")
                 published = preparedPointer != null
                 if (published) preparedCandidate = candidate
             }
             if (!published && isCurrentRequest(appleMusicId, requestGeneration)) {
+                logger("automatic lyrics fetching id=$appleMusicId")
                 val candidate = runCatching { fetchCandidate(appleMusicId) }.getOrNull()
+                if (candidate == null) logger("automatic lyrics no candidate id=$appleMusicId")
                 if (candidate != null && isCurrentRequest(appleMusicId, requestGeneration)) {
                     preparedPointer = preparePointer(
                         candidate.ttml,
@@ -444,7 +440,9 @@ internal class AutoLyricsReplacementSession(
                     published = preparedPointer != null
                     if (published) {
                         preparedCandidate = candidate
-                        if (isCurrentRequest(appleMusicId, requestGeneration)) {
+                        logger("automatic lyrics prepared source=${candidate.source} id=$appleMusicId")
+                        if (candidate.source.startsWith(CustomLyricsSources.DESKTOP_LYRICS) &&
+                            isCurrentRequest(appleMusicId, requestGeneration)) {
                             runCatching { cache.write(appleMusicId, candidate.ttml) }
                         }
                     }
@@ -470,6 +468,7 @@ internal class AutoLyricsReplacementSession(
                         runCatching { cache.delete(appleMusicId) }
                     }
                     if (isCurrentRequest(appleMusicId, requestGeneration)) {
+                        onCandidatePrepared?.invoke(appleMusicId, preparedCandidate)
                         onReplacementPublished?.invoke(appleMusicId)
                         synchronized(lock) {
                             if (isCurrentRequestLocked(appleMusicId, requestGeneration)) {
@@ -490,6 +489,12 @@ internal class AutoLyricsReplacementSession(
                 }
             }
         } finally {
+            val completedRefresh = synchronized(lock) {
+                (refreshGeneration == requestGeneration && isCurrentRequestLocked(appleMusicId, requestGeneration)).also {
+                    if (it) refreshGeneration = null
+                }
+            }
+            if (completedRefresh) onRefreshFinished?.invoke(appleMusicId, published)
             synchronized(lock) {
                 if (pending[appleMusicId] == requestGeneration) pending.remove(appleMusicId)
             }
@@ -506,7 +511,9 @@ internal class AutoLyricsReplacementSession(
             logger("automatic lyrics candidate rejected as non-word source=$source id=$appleMusicId")
             return null
         }
+        logger("automatic lyrics native parse begin source=$source id=$appleMusicId")
         val pointer = runCatching { parseTtml(ttml) }.getOrNull() ?: return null
+        logger("automatic lyrics native parse end source=$source id=$appleMusicId")
         if (!isPrepared(pointer, appleMusicId) && !runCatching {
                 bindAdamId(pointer, appleMusicId)
             }.getOrDefault(false)
@@ -532,6 +539,10 @@ internal class AutoLyricsReplacementSession(
     private fun markFailedIfCurrent(appleMusicId: Long, requestGeneration: Long) {
         synchronized(lock) {
             if (isCurrentRequestLocked(appleMusicId, requestGeneration)) {
+                refreshBackup?.takeIf { it.first == appleMusicId }?.let { (_, pointer) ->
+                    synchronized(pointers) { pointers[appleMusicId] = pointer }
+                }
+                refreshBackup = null
                 failedUntil[appleMusicId] = nowMs() + retryCooldownMs
             }
         }

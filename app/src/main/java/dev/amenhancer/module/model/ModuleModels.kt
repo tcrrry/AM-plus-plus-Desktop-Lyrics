@@ -90,6 +90,7 @@ data class CustomLyricsManifest(
 object CustomLyricsSources {
     const val MANUAL = "manual"
     const val AUTO_CACHE = "auto-cache"
+    const val DESKTOP_LYRICS = "desktop-lyrics"
     const val AMLL = "amll-ttml-db"
     const val AM_LYRICS = "am-lyrics"
     const val LUNABEAT = "lunabeat-ttml-hub"
